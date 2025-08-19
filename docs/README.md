@@ -88,7 +88,7 @@ Stripe sends webhook events when your users update or delete their subscriptions
 2. Run the local webhook server:
 
 ```sh
-stripe listen --forward-to localhost:5173/api/webhook
+stripe listen --forward-to $(npx convex env get CONVEX_SITE_URL)/stripe/webhook
 ```
 
 4. After running the first time, you may be prompted to authenticate. If so, after
