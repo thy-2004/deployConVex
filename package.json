@@ -23,7 +23,7 @@
     "@radix-ui/react-select": "^2.1.1",
     "@radix-ui/react-slot": "^1.1.0",
     "@radix-ui/react-switch": "^1.1.0",
-    "@react-email/components": "0.0.22",
+    "@react-email/components": "^0.0.16",
     "@tanstack/react-form": "0.26.4",
     "@tanstack/react-query": "^5.51.15",
     "@tanstack/react-router": "^1.45.11",
@@ -31,7 +31,7 @@
     "@xixixao/uploadstuff": "^0.0.5",
     "class-variance-authority": "^0.7.0",
     "convex": "^1.13.2",
-    "convex-helpers": "^0.1.50",
+    "convex-helpers": "^0.1.2",
     "cookie": "^0.6.0",
     "i18next": "^23.12.2",
     "i18next-browser-languagedetector": "^8.0.0",
@@ -41,12 +41,14 @@
     "oslo": "^1.2.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "react-dropzone": "^14.3.8",
     "react-helmet-async": "^2.0.5",
     "react-i18next": "^15.0.0",
     "resend": "^3.2.0",
     "stripe": "^16.6.0",
     "tailwind-merge": "^2.4.0",
-    "tailwindcss-animate": "^1.0.7"
+    "tailwindcss-animate": "^1.0.7",
+    "zod": "^3.22.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.8.0",
