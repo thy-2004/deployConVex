@@ -12,6 +12,7 @@ import { currencyValidator, intervalValidator, PLANS } from "@cvx/schema";
 import { api, internal } from "~/convex/_generated/api";
 import { SITE_URL, STRIPE_SECRET_KEY } from "@cvx/env";
 import { asyncMap } from "convex-helpers";
+import { planKeyValidator } from "@cvx/schema";
 
 /**
  * TODO: Uncomment to require Stripe keys.
@@ -241,7 +242,13 @@ export const PREAUTH_createFreeStripeSubscription = internalAction({
       throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
     }
 
-    const yearlyPrice = plan.prices.year[args.currency];
+    const yearlyPrice = plan?.prices?.year?.[args.currency as keyof typeof plan.prices.year];
+    if (!yearlyPrice) {
+      throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
+    }
+    if (!yearlyPrice.stripeId) {
+      throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
+    }
 
     const stripeSubscription = await stripe.subscriptions.create({
       customer: args.customerId,
@@ -327,7 +334,11 @@ export const createSubscriptionCheckout = action({
       return;
     }
 
-    const price = newPlan?.prices[args.planInterval][args.currency];
+    const price = newPlan?.prices?.[args.planInterval]?.[args.currency as keyof typeof newPlan.prices[typeof args.planInterval]];
+    if (!price?.stripeId) {
+       throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
+}
+
 
     const checkout = await stripe.checkout.sessions.create({
       customer: user.customerId,
@@ -386,5 +397,123 @@ export const cancelCurrentUserSubscriptions = internalAction({
     await asyncMap(subscriptions, async (subscription) => {
       await stripe.subscriptions.cancel(subscription.data[0].subscription);
     });
+  },
+});
+export const findPlanByStripeId = internalQuery({
+  args: { stripeId: v.string() },
+  handler: async (ctx, args) => {
+    return ctx.db
+      .query("plans")
+      .withIndex("stripeId", (q) => q.eq("stripeId", args.stripeId))
+      .unique();
+  },
+});
+
+export const insertPlan = internalMutation({
+  args: {
+    key: planKeyValidator,
+    stripeId: v.string(),
+    name: v.string(),
+    description: v.string(),
+    prices: v.any(),
+  },
+  handler: async (ctx, args) => {
+    await ctx.db.insert("plans", {
+      key: args.key as "free" | "pro" | "business",
+      stripeId: args.stripeId,
+      name: args.name,
+      description: args.description,
+      prices: args.prices,
+    });
+  },
+});
+
+export const updatePlanByStripeId = internalMutation({
+  args: {
+    stripeId: v.string(),
+    data: v.any(),
+  },
+  handler: async (ctx, args) => {
+    const plan = await ctx.db
+      .query("plans")
+      .withIndex("stripeId", (q) => q.eq("stripeId", args.stripeId))
+      .unique();
+    if (!plan) return;
+    await ctx.db.patch(plan._id, args.data);
+  },
+});
+
+/**
+ * Sync Stripe Products & Prices to Convex 'plans' table
+ */
+export const syncStripeProductsToConvex = internalAction({
+  args: {},
+  handler: async (ctx) => {
+    console.log("🔄 Syncing Stripe Products → Convex...");
+    const products = await stripe.products.list({ active: true });
+    const prices = await stripe.prices.list({ active: true });
+
+    for (const product of products.data) {
+      // Tìm các price tương ứng theo product.id
+      const productPrices = prices.data.filter(
+        (p) => p.product === product.id && p.recurring
+      );
+
+      // Nếu không có price hợp lệ thì bỏ qua
+      if (productPrices.length === 0) continue;
+
+      // Gom giá theo interval (month/year) và currency (usd/eur)
+      const priceMap: any = {
+        month: {},
+        year: {},
+      };
+
+      for (const price of productPrices) {
+        const interval = price.recurring?.interval as "month" | "year";
+        const currency = price.currency as "usd" | "eur";
+
+        priceMap[interval][currency] = {
+          stripeId: price.id,
+          amount: price.unit_amount ?? 0,
+        };
+      }
+
+      // Xác định key: free/pro/business
+      const key = product.name.toLowerCase().includes("pro")
+        ? PLANS.PRO
+        : product.name.toLowerCase().includes("free")
+        ? PLANS.FREE
+        : "business"; // fallback nếu bạn có Business Plan
+
+      // Kiểm tra đã có trong Convex chưa
+      const existing = await ctx.runQuery(
+        internal.stripe.findPlanByStripeId,
+        { stripeId: product.id }
+      );
+
+      if (existing) {
+        console.log(`↻ Updating existing plan: ${product.name}`);
+        await ctx.runMutation(internal.stripe.updatePlanByStripeId, {
+          stripeId: product.id,
+          data: {
+            key,
+            name: product.name,
+            description: product.description || "",
+            prices: priceMap,
+          },
+        });
+      } else {
+        console.log(`➕ Inserting new plan: ${product.name}`);
+        await ctx.runMutation(internal.stripe.insertPlan, {
+          key,
+          stripeId: product.id,
+          name: product.name,
+          description: product.description || "",
+          prices: priceMap,
+        });
+      }
+    }
+
+    console.log("✅ Stripe → Convex sync completed!");
   },
 });

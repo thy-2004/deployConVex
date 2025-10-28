@@ -5,10 +5,13 @@ import { v, Infer } from "convex/values";
 export const CURRENCIES = {
   USD: "usd",
   EUR: "eur",
+  VND: "vnd", // ✅ thêm VND
 } as const;
+
 export const currencyValidator = v.union(
   v.literal(CURRENCIES.USD),
   v.literal(CURRENCIES.EUR),
+  v.literal(CURRENCIES.VND),
 );
 export type Currency = Infer<typeof currencyValidator>;
 
@@ -25,10 +28,13 @@ export type Interval = Infer<typeof intervalValidator>;
 export const PLANS = {
   FREE: "free",
   PRO: "pro",
+  BUSINESS: "business",
 } as const;
+
 export const planKeyValidator = v.union(
   v.literal(PLANS.FREE),
   v.literal(PLANS.PRO),
+  v.literal(PLANS.BUSINESS),
 );
 export type PlanKey = Infer<typeof planKeyValidator>;
 
@@ -36,13 +42,16 @@ const priceValidator = v.object({
   stripeId: v.string(),
   amount: v.number(),
 });
+
 const pricesValidator = v.object({
-  [CURRENCIES.USD]: priceValidator,
-  [CURRENCIES.EUR]: priceValidator,
+  [CURRENCIES.USD]: v.optional(priceValidator),
+  [CURRENCIES.EUR]: v.optional(priceValidator),
+  [CURRENCIES.VND]: v.optional(priceValidator), // ✅ thêm optional VND
 });
 
 const schema = defineSchema({
   ...authTables,
+
   users: defineTable({
     name: v.optional(v.string()),
     username: v.optional(v.string()),
@@ -57,6 +66,7 @@ const schema = defineSchema({
   })
     .index("email", ["email"])
     .index("customerId", ["customerId"]),
+
   plans: defineTable({
     key: planKeyValidator,
     stripeId: v.string(),
@@ -69,6 +79,7 @@ const schema = defineSchema({
   })
     .index("key", ["key"])
     .index("stripeId", ["stripeId"]),
+
   subscriptions: defineTable({
     userId: v.id("users"),
     planId: v.id("plans"),
