@@ -8,7 +8,7 @@ import {
 import { v } from "convex/values";
 import { ERRORS } from "~/errors";
 import { auth } from "@cvx/auth";
-import { currencyValidator, intervalValidator, PLANS } from "@cvx/schema";
+import { currencyValidator, intervalValidator, PLANS, CURRENCIES } from "@cvx/schema";
 import { api, internal } from "~/convex/_generated/api";
 import { SITE_URL, STRIPE_SECRET_KEY } from "@cvx/env";
 import { asyncMap } from "convex-helpers";
@@ -62,28 +62,67 @@ export const PREAUTH_getUserById = internalQuery({
   },
 });
 
+export const PREAUTH_getUserSubscription = internalQuery({
+  args: {
+    userId: v.id("users"),
+  },
+  handler: async (ctx, args) => {
+    return ctx.db
+      .query("subscriptions")
+      .withIndex("userId", (q) => q.eq("userId", args.userId))
+      .unique();
+  },
+});
+
 export const PREAUTH_createStripeCustomer = internalAction({
   args: {
     currency: currencyValidator,
     userId: v.id("users"),
   },
   handler: async (ctx, args) => {
-    const user = await ctx.runQuery(internal.stripe.PREAUTH_getUserById, {
-      userId: args.userId,
-    });
-    if (!user || user.customerId)
+    try {
+      const user = await ctx.runQuery(internal.stripe.PREAUTH_getUserById, {
+        userId: args.userId,
+      });
+      if (!user) {
+        throw new Error("User not found");
+      }
+      if (user.customerId) {
+        // Customer đã tồn tại, không cần tạo lại
+        return;
+      }
+
+      if (!user.email) {
+        throw new Error("User email is required to create Stripe customer");
+      }
+
+      const customer = await stripe.customers
+        .create({ 
+          email: user.email, 
+          name: user.username || undefined 
+        })
+        .catch((err) => {
+          console.error("Stripe customer creation error:", err);
+          throw new Error(`Failed to create Stripe customer: ${err instanceof Error ? err.message : "Unknown error"}`);
+        });
+      
+      if (!customer) {
+        throw new Error(ERRORS.STRIPE_CUSTOMER_NOT_CREATED);
+      }
+
+      await ctx.runAction(internal.stripe.PREAUTH_createFreeStripeSubscription, {
+        userId: args.userId,
+        customerId: customer.id,
+        currency: args.currency,
+      });
+    } catch (error) {
+      console.error("PREAUTH_createStripeCustomer error:", error);
+      // Re-throw với message rõ ràng hơn
+      if (error instanceof Error) {
+        throw error;
+      }
       throw new Error(ERRORS.STRIPE_CUSTOMER_NOT_CREATED);
-
-    const customer = await stripe.customers
-      .create({ email: user.email, name: user.username })
-      .catch((err) => console.error(err));
-    if (!customer) throw new Error(ERRORS.STRIPE_CUSTOMER_NOT_CREATED);
-
-    await ctx.runAction(internal.stripe.PREAUTH_createFreeStripeSubscription, {
-      userId: args.userId,
-      customerId: customer.id,
-      currency: args.currency,
-    });
+    }
   },
 });
 
@@ -237,43 +276,59 @@ export const PREAUTH_createFreeStripeSubscription = internalAction({
     currency: currencyValidator,
   },
   handler: async (ctx, args) => {
-    const plan = await ctx.runQuery(internal.stripe.UNAUTH_getDefaultPlan);
-    if (!plan) {
-      throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
-    }
+    try {
+      const plan = await ctx.runQuery(internal.stripe.UNAUTH_getDefaultPlan);
+      if (!plan) {
+        console.error("FREE plan not found in database. Please sync Stripe products first.");
+        throw new Error("FREE plan not found. Please contact support or try again later.");
+      }
 
-    const yearlyPrice = plan?.prices?.year?.[args.currency as keyof typeof plan.prices.year];
-    if (!yearlyPrice) {
-      throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
-    }
-    if (!yearlyPrice.stripeId) {
-      throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
-    }
+      // Kiểm tra xem đã có subscription chưa
+      const existingSubscription = await ctx.runQuery(internal.stripe.PREAUTH_getUserSubscription, {
+        userId: args.userId,
+      });
+      
+      if (existingSubscription) {
+        // Đã có subscription rồi, không cần tạo lại
+        console.log("Subscription already exists for user");
+        return;
+      }
 
-    const stripeSubscription = await stripe.subscriptions.create({
-      customer: args.customerId,
-      items: [{ price: yearlyPrice?.stripeId }],
-    });
-    if (!stripeSubscription) {
+      // FREE plan không cần tạo subscription trong Stripe (vì nó là $0)
+      // Chỉ cần tạo subscription record trong database
+      const now = Math.floor(Date.now() / 1000);
+      const oneYearFromNow = now + 365 * 24 * 60 * 60; // 1 năm sau
+
+      // Tìm price cho FREE plan (có thể không có stripeId vì là $0)
+      const yearlyPrice = plan?.prices?.year?.[args.currency as keyof typeof plan.prices.year];
+      const priceStripeId = yearlyPrice?.stripeId || `free_${args.currency}_year`; // Fake ID nếu không có
+
+      // Tạo subscription record trong database mà không cần gọi Stripe API
+      await ctx.runMutation(internal.stripe.PREAUTH_createSubscription, {
+        userId: args.userId,
+        planId: plan._id,
+        currency: args.currency,
+        priceStripeId: priceStripeId,
+        stripeSubscriptionId: `free_sub_${args.userId}`, // Fake Stripe subscription ID
+        status: "active",
+        interval: "year",
+        currentPeriodStart: now,
+        currentPeriodEnd: oneYearFromNow,
+        cancelAtPeriodEnd: false,
+      });
+
+      await ctx.runMutation(internal.stripe.PREAUTH_updateCustomerId, {
+        userId: args.userId,
+        customerId: args.customerId,
+      });
+    } catch (error) {
+      console.error("PREAUTH_createFreeStripeSubscription error:", error);
+      // Re-throw với message rõ ràng hơn
+      if (error instanceof Error) {
+        throw error;
+      }
       throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
     }
-    await ctx.runMutation(internal.stripe.PREAUTH_createSubscription, {
-      userId: args.userId,
-      planId: plan._id,
-      currency: args.currency,
-      priceStripeId: stripeSubscription.items.data[0].price.id,
-      stripeSubscriptionId: stripeSubscription.id,
-      status: stripeSubscription.status,
-      interval: "year",
-      currentPeriodStart: stripeSubscription.current_period_start,
-      currentPeriodEnd: stripeSubscription.current_period_end,
-      cancelAtPeriodEnd: stripeSubscription.cancel_at_period_end,
-    });
-
-    await ctx.runMutation(internal.stripe.PREAUTH_updateCustomerId, {
-      userId: args.userId,
-      customerId: args.customerId,
-    });
   },
 });
 
@@ -318,40 +373,231 @@ export const createSubscriptionCheckout = action({
     currency: currencyValidator,
   },
   handler: async (ctx, args): Promise<string | undefined> => {
-    const user = await ctx.runQuery(api.app.getCurrentUser);
-    if (!user || !user.customerId) {
+    try {
+      // Kiểm tra Stripe key
+      if (!STRIPE_SECRET_KEY) {
+        console.error("Stripe secret key not configured");
+        throw new Error("Stripe secret key not configured. Please set STRIPE_SECRET_KEY in Convex environment variables.");
+      }
+
+      const user = await ctx.runQuery(api.app.getCurrentUser);
+      if (!user) {
+        console.error("User not found");
+        throw new Error("User not found. Please log in again.");
+      }
+      
+      // Kiểm tra username - nếu chưa có username thì cần hoàn thành onboarding
+      if (!user.username) {
+        console.error("User does not have username. User needs to complete onboarding.");
+        throw new Error("Please complete onboarding first. You need a username to create a subscription.");
+      }
+      
+      // Nếu chưa có customerId nhưng đã có username, tự động tạo customerId
+      if (!user.customerId) {
+        console.log("User has username but no customerId. Creating Stripe customer...");
+        const currency = args.currency;
+        try {
+          // Tạo Stripe customer và subscription
+          // PREAUTH_createStripeCustomer sẽ tạo customer và gọi PREAUTH_updateCustomerId
+          await ctx.runAction(internal.stripe.PREAUTH_createStripeCustomer, {
+            currency,
+            userId: user._id,
+          });
+          
+          // Lấy lại user để có customerId mới (mutation đã chạy xong trong action)
+          const updatedUser = await ctx.runQuery(api.app.getCurrentUser);
+          if (!updatedUser?.customerId) {
+            // Nếu vẫn chưa có, có thể do độ trễ của database, thử lại một lần nữa
+            await new Promise(resolve => setTimeout(resolve, 500));
+            const retryUser = await ctx.runQuery(api.app.getCurrentUser);
+            if (!retryUser?.customerId) {
+              throw new Error("Failed to create Stripe customer. Please refresh the page and try again.");
+            }
+            user.customerId = retryUser.customerId;
+          } else {
+            user.customerId = updatedUser.customerId;
+          }
+        } catch (error) {
+          console.error("Error creating Stripe customer:", error);
+          // Nếu lỗi là do customer đã tồn tại hoặc các lỗi khác, thử lấy lại user để xem có customerId không
+          const retryUser = await ctx.runQuery(api.app.getCurrentUser);
+          if (retryUser?.customerId) {
+            // Nếu đã có customerId (có thể đã được tạo bởi process khác), sử dụng nó
+            user.customerId = retryUser.customerId;
+            console.log("Customer ID found after error, continuing...");
+          } else {
+            // Nếu vẫn chưa có customerId, throw error với message rõ ràng
+            if (error instanceof Error) {
+              // Kiểm tra các lỗi cụ thể và cung cấp message phù hợp
+              if (error.message.includes("Price not available")) {
+                throw new Error(`Price not available for FREE plan in ${args.currency.toUpperCase()}. Please use USD or EUR, or contact support.`);
+              }
+              if (error.message.includes("User email is required")) {
+                throw new Error("User email is required. Please update your profile with an email address.");
+              }
+              throw error;
+            }
+            throw new Error(`Failed to create Stripe customer: ${error instanceof Error ? error.message : "Unknown error"}`);
+          }
+        }
+      }
+
+      const { currentSubscription, newPlan } = await ctx.runQuery(
+        internal.stripe.getCurrentUserSubscription,
+        { planId: args.planId },
+      );
+      if (!currentSubscription?.plan) {
+        console.error("Current subscription not found");
+        throw new Error("Current subscription not found. Please complete onboarding first.");
+      }
+      if (!newPlan) {
+        console.error("New plan not found");
+        throw new Error("Selected plan not found. Please refresh the page.");
+      }
+
+      // Nếu đang chọn cùng plan, không làm gì
+      if (currentSubscription.plan.key === newPlan.key) {
+        return;
+      }
+
+      // Debug: Log cấu trúc plan để kiểm tra
+      console.log("Plan structure:", {
+        planKey: newPlan.key,
+        planName: newPlan.name,
+        interval: args.planInterval,
+        currency: args.currency,
+        prices: newPlan.prices,
+        availablePrices: newPlan.prices?.[args.planInterval],
+      });
+
+      // Truy cập price một cách an toàn hơn
+      let intervalPrices = newPlan?.prices?.[args.planInterval];
+      let actualInterval = args.planInterval;
+      
+      // Nếu interval yêu cầu không có prices, thử fallback sang interval khác
+      if (!intervalPrices || Object.keys(intervalPrices).length === 0) {
+        console.warn(`No prices found for interval ${args.planInterval}, trying fallback interval...`);
+        // Thử interval khác (month -> year hoặc year -> month)
+        const fallbackInterval = args.planInterval === "month" ? "year" : "month";
+        const fallbackPrices = newPlan?.prices?.[fallbackInterval];
+        
+        if (fallbackPrices && Object.keys(fallbackPrices).length > 0) {
+          console.log(`Using fallback interval: ${fallbackInterval} instead of ${args.planInterval}`);
+          intervalPrices = fallbackPrices;
+          actualInterval = fallbackInterval;
+        } else {
+          console.error(`No prices found for interval ${args.planInterval} in plan ${newPlan.key}`);
+          throw new Error(`Price interval not available for ${newPlan.name} plan. Please select a different interval or sync Stripe products.`);
+        }
+      }
+
+      // Kiểm tra xem intervalPrices có phải là object rỗng không
+      const availableCurrencies = Object.keys(intervalPrices).filter(
+        key => {
+          const price = intervalPrices[key as keyof typeof intervalPrices];
+          return price !== undefined && 
+                 price !== null &&
+                 typeof price === 'object' &&
+                 'stripeId' in price &&
+                 price.stripeId;
+        }
+      );
+      
+      if (availableCurrencies.length === 0) {
+        console.error(`No prices configured for plan ${newPlan.key}, interval ${actualInterval}`);
+        console.error("Full plan structure:", JSON.stringify(newPlan, null, 2));
+        throw new Error(`No prices configured for ${newPlan.name} plan (${actualInterval} interval). Please sync Stripe products. You can call the 'stripe:syncPlans' action from Convex Dashboard or use the sync button in the billing settings.`);
+      }
+
+      // Tìm price cho currency yêu cầu
+      let price = intervalPrices[args.currency as keyof typeof intervalPrices];
+      
+      // Nếu không có price cho currency yêu cầu, thử fallback sang các currency khác theo thứ tự ưu tiên
+      if (!price) {
+        console.warn(`Price not found for currency ${args.currency}, trying fallback currencies...`);
+        console.log("Available currencies:", availableCurrencies);
+        
+        // Thứ tự ưu tiên: USD -> EUR -> VND -> bất kỳ currency nào có sẵn
+        const fallbackOrder = [CURRENCIES.USD, CURRENCIES.EUR, CURRENCIES.VND];
+        
+        for (const fallbackCurrency of fallbackOrder) {
+          if (availableCurrencies.includes(fallbackCurrency)) {
+            price = intervalPrices[fallbackCurrency as keyof typeof intervalPrices];
+            if (price && price.stripeId) {
+              console.log(`Using fallback currency: ${fallbackCurrency} instead of ${args.currency}`);
+              break;
+            }
+          }
+        }
+        
+        // Nếu vẫn không có, thử currency đầu tiên có sẵn
+        if (!price && availableCurrencies.length > 0) {
+          const firstAvailable = availableCurrencies[0] as keyof typeof intervalPrices;
+          price = intervalPrices[firstAvailable];
+          if (price && price.stripeId) {
+            console.log(`Using first available currency: ${firstAvailable}`);
+          }
+        }
+      }
+
+      if (!price) {
+        console.error(`No price found for plan ${newPlan.key}, interval ${args.planInterval}`);
+        console.error("Available currencies:", availableCurrencies);
+        console.error("Full intervalPrices:", JSON.stringify(intervalPrices, null, 2));
+        throw new Error(`No price available for ${newPlan.name} plan. Available currencies: ${availableCurrencies.join(", ").toUpperCase()}. Please sync Stripe products or contact support.`);
+      }
+
+      if (!price.stripeId) {
+        console.error(`Stripe ID not found for price in plan ${newPlan.key}, interval ${args.planInterval}`);
+        throw new Error(`Stripe price ID not configured for ${newPlan.name} plan. Please sync Stripe products.`);
+      }
+
+      // Nếu user đã có subscription (không phải FREE), dùng subscription update thay vì checkout mới
+      if (currentSubscription.plan.key !== PLANS.FREE) {
+        try {
+          // Update existing subscription
+          const subscription = await stripe.subscriptions.retrieve(currentSubscription.stripeId);
+          await stripe.subscriptions.update(subscription.id, {
+            items: [{
+              id: subscription.items.data[0].id,
+              price: price.stripeId,
+            }],
+            proration_behavior: 'always_invoice', // Charge immediately for the difference
+          });
+          // Return billing page URL để frontend redirect
+          return `${SITE_URL}/dashboard/settings/billing?updated=true`;
+        } catch (error) {
+          console.error("Error updating subscription:", error);
+          throw new Error(`Failed to update subscription: ${error instanceof Error ? error.message : "Unknown error"}`);
+        }
+      }
+
+      // Nếu là FREE plan, tạo checkout session mới
+      try {
+        const checkout = await stripe.checkout.sessions.create({
+          customer: user.customerId,
+          line_items: [{ price: price.stripeId, quantity: 1 }],
+          mode: "subscription",
+          payment_method_types: ["card"],
+          success_url: `${SITE_URL}/dashboard/checkout`,
+          cancel_url: `${SITE_URL}/dashboard/settings/billing`,
+        });
+        if (!checkout || !checkout.url) {
+          throw new Error("Failed to create checkout session");
+        }
+        return checkout.url;
+      } catch (error) {
+        console.error("Error creating checkout session:", error);
+        throw new Error(`Failed to create checkout session: ${error instanceof Error ? error.message : "Unknown error"}`);
+      }
+    } catch (error) {
+      console.error("createSubscriptionCheckout error:", error);
+      // Re-throw với message rõ ràng hơn
+      if (error instanceof Error) {
+        throw error;
+      }
       throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
     }
-
-    const { currentSubscription, newPlan } = await ctx.runQuery(
-      internal.stripe.getCurrentUserSubscription,
-      { planId: args.planId },
-    );
-    if (!currentSubscription?.plan) {
-      throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
-    }
-    if (currentSubscription.plan.key !== PLANS.FREE) {
-      return;
-    }
-
-    const price = newPlan?.prices?.[args.planInterval]?.[args.currency as keyof typeof newPlan.prices[typeof args.planInterval]];
-    if (!price?.stripeId) {
-       throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
-}
-
-
-    const checkout = await stripe.checkout.sessions.create({
-      customer: user.customerId,
-      line_items: [{ price: price?.stripeId, quantity: 1 }],
-      mode: "subscription",
-      payment_method_types: ["card"],
-      success_url: `${SITE_URL}/dashboard/checkout`,
-      cancel_url: `${SITE_URL}/dashboard/settings/billing`,
-    });
-    if (!checkout) {
-      throw new Error(ERRORS.STRIPE_SOMETHING_WENT_WRONG);
-    }
-    return checkout.url || undefined;
   },
 });
 
@@ -444,7 +690,27 @@ export const updatePlanByStripeId = internalMutation({
 });
 
 /**
+ * Public action to sync Stripe Products & Prices to Convex 'plans' table
+ * This can be called from the frontend to manually sync plans
+ */
+export const syncPlans = action({
+  args: {},
+  handler: async (ctx) => {
+    // Check if user is authenticated
+    const userId = await auth.getUserId(ctx);
+    if (!userId) {
+      throw new Error("You must be logged in to sync plans");
+    }
+    
+    // Call the internal sync action
+    await ctx.runAction(internal.stripe.syncStripeProductsToConvex, {});
+    return { success: true, message: "Plans synced successfully" };
+  },
+});
+
+/**
  * Sync Stripe Products & Prices to Convex 'plans' table
+ * This is an internal action, but we also expose a public action for manual syncing
  */
 export const syncStripeProductsToConvex = internalAction({
   args: {},
@@ -470,12 +736,17 @@ export const syncStripeProductsToConvex = internalAction({
 
       for (const price of productPrices) {
         const interval = price.recurring?.interval as "month" | "year";
-        const currency = price.currency as "usd" | "eur";
+        const currency = price.currency.toLowerCase() as "usd" | "eur" | "vnd";
 
-        priceMap[interval][currency] = {
-          stripeId: price.id,
-          amount: price.unit_amount ?? 0,
-        };
+        // Chỉ lưu các currency được hỗ trợ
+        if (currency === "usd" || currency === "eur" || currency === "vnd") {
+          priceMap[interval][currency] = {
+            stripeId: price.id,
+            amount: price.unit_amount ?? 0,
+          };
+        } else {
+          console.warn(`Unsupported currency: ${currency} for product ${product.name}`);
+        }
       }
 
       // Xác định key: free/pro/business

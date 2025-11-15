@@ -45,6 +45,7 @@ function Login() {
 function LoginForm({ onSubmit }: { onSubmit: (email: string) => void }) {
   const { signIn } = useAuthActions();
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const form = useForm({
     validatorAdapter: zodValidator(),
@@ -53,9 +54,16 @@ function LoginForm({ onSubmit }: { onSubmit: (email: string) => void }) {
     },
     onSubmit: async ({ value }) => {
       setIsSubmitting(true);
-      await signIn("resend-otp", value);
-      onSubmit(value.email);
-      setIsSubmitting(false);
+      setError(null);
+      try {
+        await signIn("resend-otp", value);
+        onSubmit(value.email);
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : "Failed to send verification email. Please try again.";
+        setError(errorMessage);
+      } finally {
+        setIsSubmitting(false);
+      }
     },
   });
   return (
@@ -109,13 +117,11 @@ function LoginForm({ onSubmit }: { onSubmit: (email: string) => void }) {
               {form.state.fieldMeta.email?.errors.join(" ")}
             </span>
           )}
-          {/*
-          {!authEmail && authError && (
+          {error && (
             <span className="mb-2 text-sm text-destructive dark:text-destructive-foreground">
-              {authError.message}
+              {error}
             </span>
           )}
-          */}
         </div>
 
         <Button type="submit" className="w-full">
@@ -138,7 +144,15 @@ function LoginForm({ onSubmit }: { onSubmit: (email: string) => void }) {
         <Button
           variant="outline"
           className="w-full gap-2 bg-transparent"
-          onClick={() => signIn("github", { redirectTo: "/login" })}
+          onClick={async () => {
+            setError(null);
+            try {
+              await signIn("github", { redirectTo: "/login" });
+            } catch (err) {
+              const errorMessage = err instanceof Error ? err.message : "Failed to sign in with GitHub. Please try again.";
+              setError(errorMessage);
+            }
+          }}
         >
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -166,13 +180,25 @@ function LoginForm({ onSubmit }: { onSubmit: (email: string) => void }) {
 
 function VerifyForm({ email }: { email: string }) {
   const { signIn } = useAuthActions();
+  const [error, setError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  
   const form = useForm({
     validatorAdapter: zodValidator(),
     defaultValues: {
       code: "",
     },
     onSubmit: async ({ value }) => {
-      await signIn("resend-otp", { email, code: value.code });
+      setIsSubmitting(true);
+      setError(null);
+      try {
+        await signIn("resend-otp", { email, code: value.code });
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : "Invalid verification code. Please try again.";
+        setError(errorMessage);
+      } finally {
+        setIsSubmitting(false);
+      }
     },
   });
   return (
@@ -227,17 +253,19 @@ function VerifyForm({ email }: { email: string }) {
               {form.state.fieldMeta.code?.errors.join(" ")}
             </span>
           )}
-          {/*
-          {!authEmail && authError && (
+          {error && (
             <span className="mb-2 text-sm text-destructive dark:text-destructive-foreground">
-              {authError.message}
+              {error}
             </span>
           )}
-          */}
         </div>
 
-        <Button type="submit" className="w-full">
-          Continue
+        <Button type="submit" className="w-full" disabled={isSubmitting}>
+          {isSubmitting ? (
+            <Loader2 className="animate-spin" />
+          ) : (
+            "Continue"
+          )}
         </Button>
       </form>
 
@@ -247,7 +275,15 @@ function VerifyForm({ email }: { email: string }) {
           Did not receive the code?
         </p>
         <Button
-          onClick={() => signIn("resend-otp", { email })}
+          onClick={async () => {
+            setError(null);
+            try {
+              await signIn("resend-otp", { email });
+            } catch (err) {
+              const errorMessage = err instanceof Error ? err.message : "Failed to resend code. Please try again.";
+              setError(errorMessage);
+            }
+          }}
           variant="ghost"
           className="w-full hover:bg-transparent"
         >

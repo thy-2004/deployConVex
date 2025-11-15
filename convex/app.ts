@@ -124,23 +124,26 @@ export const getActivePlans = query({
   args: {},
   handler: async (ctx) => {
     const userId = await auth.getUserId(ctx);
-    if (!userId) {
-      return;
-    }
+    if (!userId) return;
+
     const [free, pro] = await asyncMap(
       [PLANS.FREE, PLANS.PRO] as const,
       (key) =>
         ctx.db
           .query("plans")
           .withIndex("key", (q) => q.eq("key", key))
-          .unique(),
+          .first(), 
     );
+
     if (!free || !pro) {
       throw new Error("Plan not found");
     }
+
     return { free, pro };
   },
 });
+
+
 
 export const deleteCurrentUserAccount = mutation({
   args: {},
@@ -179,5 +182,121 @@ export const deleteCurrentUserAccount = mutation({
       }
       await ctx.db.delete(authAccount._id);
     });
+  },
+});
+
+// Apps Management
+export const getUserApps = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await auth.getUserId(ctx);
+    if (!userId) {
+      return [];
+    }
+    return await ctx.db
+      .query("apps")
+      .withIndex("userId", (q) => q.eq("userId", userId))
+      .collect();
+  },
+});
+
+export const createApp = mutation({
+  args: {
+    name: v.string(),
+    description: v.optional(v.string()),
+  },
+  handler: async (ctx, args) => {
+    const userId = await auth.getUserId(ctx);
+    if (!userId) {
+      throw new Error("User not found");
+    }
+
+    // Generate API key
+    const apiKey = `sk_${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`;
+
+    const now = Date.now();
+    const appId = await ctx.db.insert("apps", {
+      userId,
+      name: args.name,
+      description: args.description,
+      apiKey,
+      status: "active",
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    return appId;
+  },
+});
+
+export const updateApp = mutation({
+  args: {
+    appId: v.id("apps"),
+    name: v.optional(v.string()),
+    description: v.optional(v.string()),
+    status: v.optional(v.union(v.literal("active"), v.literal("inactive"))),
+  },
+  handler: async (ctx, args) => {
+    const userId = await auth.getUserId(ctx);
+    if (!userId) {
+      throw new Error("User not found");
+    }
+
+    const app = await ctx.db.get(args.appId);
+    if (!app || app.userId !== userId) {
+      throw new Error("App not found or unauthorized");
+    }
+
+    await ctx.db.patch(args.appId, {
+      ...(args.name !== undefined && { name: args.name }),
+      ...(args.description !== undefined && { description: args.description }),
+      ...(args.status !== undefined && { status: args.status }),
+      updatedAt: Date.now(),
+    });
+  },
+});
+
+export const deleteApp = mutation({
+  args: {
+    appId: v.id("apps"),
+  },
+  handler: async (ctx, args) => {
+    const userId = await auth.getUserId(ctx);
+    if (!userId) {
+      throw new Error("User not found");
+    }
+
+    const app = await ctx.db.get(args.appId);
+    if (!app || app.userId !== userId) {
+      throw new Error("App not found or unauthorized");
+    }
+
+    await ctx.db.delete(args.appId);
+  },
+});
+
+export const regenerateApiKey = mutation({
+  args: {
+    appId: v.id("apps"),
+  },
+  handler: async (ctx, args) => {
+    const userId = await auth.getUserId(ctx);
+    if (!userId) {
+      throw new Error("User not found");
+    }
+
+    const app = await ctx.db.get(args.appId);
+    if (!app || app.userId !== userId) {
+      throw new Error("App not found or unauthorized");
+    }
+
+    const newApiKey = `sk_${Math.random().toString(36).substring(2, 15)}${Math.random().toString(36).substring(2, 15)}`;
+
+    await ctx.db.patch(args.appId, {
+      apiKey: newApiKey,
+      updatedAt: Date.now(),
+    });
+
+    return newApiKey;
   },
 });

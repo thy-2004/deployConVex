@@ -1,11 +1,11 @@
-import { createFileRoute, Link } from "@tanstack/react-router";
+import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { Loader2, BadgeCheck, AlertTriangle, ExternalLink } from "lucide-react";
 import { buttonVariants } from "@/ui/button-util";
 import { useEffect, useState } from "react";
 import { Route as DashboardRoute } from "@/routes/_app/_auth/dashboard/_layout.index";
 import siteConfig from "~/site.config";
 import { PLANS } from "@cvx/schema";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { convexQuery } from "@convex-dev/react-query";
 import { api } from "@cvx/_generated/api";
 
@@ -17,19 +17,64 @@ export const Route = createFileRoute("/_app/_auth/dashboard/_layout/checkout")({
 });
 
 export default function DashboardCheckout() {
+  const queryClient = useQueryClient();
+  const navigate = useNavigate();
   const { data: user } = useQuery(convexQuery(api.app.getCurrentUser, {}));
   const isFreePlan = user?.subscription?.planKey === PLANS.FREE;
-  const [isPending, setIsPending] = useState(false);
+  const [isPending, setIsPending] = useState(true);
+  const [pollCount, setPollCount] = useState(0);
+  const maxPolls = 20; // Poll tối đa 20 lần (khoảng 1 phút)
 
+  // Polling để đợi webhook xử lý subscription update
   useEffect(() => {
-    if (isFreePlan) {
-      setIsPending(true);
-    }
-    const timeoutId = setTimeout(() => {
+    if (!user) return;
+
+    // Nếu đã là PRO plan, không cần polling
+    if (!isFreePlan) {
       setIsPending(false);
-    }, 8000);
-    return () => clearTimeout(timeoutId);
-  }, []);
+      // Redirect sau 2 giây để user thấy success message
+      const redirectTimer = setTimeout(() => {
+        navigate({ to: DashboardRoute.fullPath });
+      }, 2000);
+      return () => clearTimeout(redirectTimer);
+    }
+
+    // Nếu vẫn là FREE plan, polling để đợi webhook
+    setIsPending(true);
+    let currentPollCount = 0;
+    
+    const pollInterval = setInterval(async () => {
+      currentPollCount++;
+      
+      // Nếu đã poll quá nhiều lần, dừng lại
+      if (currentPollCount >= maxPolls) {
+        clearInterval(pollInterval);
+        setIsPending(false);
+        return;
+      }
+
+      // Refresh user data
+      await queryClient.invalidateQueries({
+        queryKey: convexQuery(api.app.getCurrentUser, {}).queryKey,
+      });
+      
+      setPollCount(currentPollCount);
+    }, 3000); // Poll mỗi 3 giây
+
+    return () => clearInterval(pollInterval);
+  }, [user, isFreePlan, queryClient, navigate]);
+
+  // Kiểm tra lại khi user data thay đổi
+  useEffect(() => {
+    if (user && !isFreePlan && isPending) {
+      // Subscription đã được update thành PRO
+      setIsPending(false);
+      // Redirect sau 2 giây
+      setTimeout(() => {
+        navigate({ to: DashboardRoute.fullPath });
+      }, 2000);
+    }
+  }, [user, isFreePlan, isPending, navigate]);
 
   if (!user) {
     return null;

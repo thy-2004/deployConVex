@@ -22,6 +22,11 @@ i18n
   .init({
     fallbackLng: "en",
     debug: true,
+    // Handle locale variants (e.g., en-US -> en)
+    load: "languageOnly",
+    // Map locale variants to base languages
+    nonExplicitSupportedLngs: true,
+    supportedLngs: languages,
   });
 
 export default i18n;
